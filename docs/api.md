@@ -1,14 +1,14 @@
 | Operation                                    | HTTP Method                                 | URL pattern / action                             | Description                                                                                                                                           |
 | -------------------------------------------- | ------------------------------------------- | ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Upload object                                | `PUT`                                       | `/{bucket}/{objectKey}`                          | Upload/create a new object (file) in the bucket. Example in AWS: single `PutObject`. ([Dokumen AWS][3])                                               |
-| Download/get object                          | `GET`                                       | `/{bucket}/{objectKey}`                          | Retrieve the object. Typically returns the file contents plus metadata.                                                                               |
+| Upload object                                | `PUT`                                       | `/{bucket}/{*key}`                               | Upload/create a new object (file) in the bucket. Example in AWS: single `PutObject`. ([Dokumen AWS][3])                                               |
+| Download/get object                          | `GET`                                       | `/{bucket}/{*key}`                               | Retrieve the object. Typically returns the file contents plus metadata.                                                                               |
 | List objects                                 | `GET`                                       | `/{bucket}?prefix={…}&delimiter={…}` etc         | List objects (“keys”) in a bucket (often optionally filtered by prefix). See “Organizing, listing, and working with your objects”. ([Dokumen AWS][4]) |
-| Delete object                                | `DELETE`                                    | `/{bucket}/{objectKey}`                          | Remove/delete an object from the bucket.                                                                                                              |
-| Head object (get metadata only)              | `HEAD`                                      | `/{bucket}/{objectKey}`                          | Retrieve metadata (size, timestamp, ETag, etc) without fetching full content.                                                                         |
+| Delete object                                | `DELETE`                                    | `/{bucket}/{*key}`                               | Remove/delete an object from the bucket.                                                                                                              |
+| Head object (get metadata only)              | `HEAD`                                      | `/{bucket}/{*key}`                               | Retrieve metadata (size, timestamp, ETag, etc) without fetching full content.                                                                         |
 | Multipart upload (for large files)           | `POST` or `PUT` sub-calls                   | Initiate + UploadPart + CompleteMultipartUpload  | For large objects you break into parts. ([Dokumen AWS][5])                                                                                            |
 | Create bucket / delete bucket / list buckets | `PUT` / `DELETE` / `GET` on bucket resource | Manage buckets (containers) rather than objects. |                                                                                                                                                       |
 
-### 1. Upload Object (`PUT /{bucket}/{key}`)
+### 1. Upload Object (`PUT /{bucket}/{*key}`)
 
 **Request**
 
@@ -36,7 +36,7 @@
 
 ---
 
-### 2. Download/Get Object (`GET /{bucket}/{key}`)
+### 2. Download/Get Object (`GET /{bucket}/{*key}`)
 
 **Request**
 
@@ -126,7 +126,7 @@
 
 ---
 
-### 4. Delete Object (`DELETE /{bucket}/{key}`)
+### 4. Delete Object (`DELETE /{bucket}/{*key}`)
 
 **Request**
 
@@ -151,7 +151,7 @@
 
 ---
 
-### 5. Initiate Multipart Upload (`POST /{bucket}/{key}?uploads`)
+### 5. Initiate Multipart Upload (`POST /{bucket}/{*key}?uploads`)
 
 **Request**
 
@@ -187,7 +187,7 @@
 
 ---
 
-### 6. Upload Part (`PUT /{bucket}/{key}?partNumber={n}&uploadId={id}`)
+### 6. Upload Part (`PUT /{bucket}/{*key}?partNumber={n}&uploadId={id}`)
 
 **Request**
 
@@ -214,7 +214,7 @@
 
 ---
 
-### 7. Complete Multipart Upload (`POST /{bucket}/{key}?uploadId={id}`)
+### 7. Complete Multipart Upload (`POST /{bucket}/{*key}?uploadId={id}`)
 
 **Request**
 

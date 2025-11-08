@@ -6,6 +6,7 @@ use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
 mod config;
+mod errors;
 mod handlers;
 mod models;
 mod routes;

@@ -58,7 +58,7 @@ rustup update
 ### 2. Clone and build
 
 ```bash
-git clone https://github.com/yourname/object-store.git
+git clone https://github.com/bavela/object-store.git
 cd object-store
 cargo build
 ```
@@ -69,7 +69,7 @@ cargo build
 cargo run -- --migrate
 ```
 
-This executes `migrations/0001_init.sql` and prepares your SQLite DB (default: `object_store.db`).
+This executes `migrations/0001_init.sql` and prepares your SQLite DB (default: `sqlite://./data/meta/object_store.db`).
 
 ### 4. Start the service
 
@@ -79,25 +79,25 @@ RUST_LOG=info cargo run
 
 By default, it will:
 
-* Bind to `0.0.0.0:8080`
-* Use `./storage/` for object payloads
-* Use `./object_store.db` as metadata store
+* Bind to `0.0.0.0:3000`
+* Use `./data/objects` for object payloads
+* Use `sqlite://./data/meta/object_store.db` as the metadata store
 
 ---
 
 ## 🧩 Example API Endpoints
 
-| Method   | Endpoint        | Description         |
-| -------- | --------------- | ------------------- |
-| `GET`    | `/healthz`      | Health probe        |
-| `GET`    | `/readyz`       | Readiness probe     |
-| `PUT`    | `/:bucket`      | Create a bucket     |
-| `DELETE` | `/:bucket`      | Delete a bucket     |
-| `GET`    | `/:bucket`      | List objects        |
-| `PUT`    | `/:bucket/*key` | Upload object       |
-| `GET`    | `/:bucket/*key` | Download object     |
-| `HEAD`   | `/:bucket/*key` | Get object metadata |
-| `DELETE` | `/:bucket/*key` | Delete object       |
+| Method   | Endpoint            | Description         |
+| -------- | ------------------- | ------------------- |
+| `GET`    | `/healthz`          | Health probe        |
+| `GET`    | `/readyz`           | Readiness probe     |
+| `PUT`    | `/{bucket}`         | Create a bucket     |
+| `DELETE` | `/{bucket}`         | Delete a bucket     |
+| `GET`    | `/{bucket}`         | List objects        |
+| `PUT`    | `/{bucket}/{*key}`  | Upload object       |
+| `GET`    | `/{bucket}/{*key}`  | Download object     |
+| `HEAD`   | `/{bucket}/{*key}`  | Get object metadata |
+| `DELETE` | `/{bucket}/{*key}`  | Delete object       |
 
 ---
 
@@ -105,17 +105,18 @@ By default, it will:
 
 `AppConfig` pulls values from both **environment variables** and CLI args.
 
-| Source    | Key                               | Default                    | Description             |
-| --------- | --------------------------------- | -------------------------- | ----------------------- |
-| env / CLI | `--host` / `HOST`                 | `0.0.0.0`                  | Server listen address   |
-| env / CLI | `--port` / `PORT`                 | `8080`                     | Server port             |
-| env / CLI | `--storage-dir` / `STORAGE_DIR`   | `storage/`                 | Local file storage root |
-| env / CLI | `--database-url` / `DATABASE_URL` | `sqlite://object_store.db` | SQLite DB URL           |
+| Source    | Key                                                 | Default                                   | Description             |
+| --------- | --------------------------------------------------- | ----------------------------------------- | ----------------------- |
+| env / CLI | `--host` / `OBJECT_STORE_HOST`                      | `0.0.0.0`                                 | Server listen address   |
+| env / CLI | `--port` / `OBJECT_STORE_PORT`                      | `3000`                                    | Server port             |
+| env / CLI | `--storage-dir` / `OBJECT_STORE_STORAGE_DIR`        | `./data/objects`                          | Local file storage root |
+| env / CLI | `--database-url` / `OBJECT_STORE_DATABASE_URL`      | `sqlite://./data/meta/object_store.db`    | SQLite DB URL           |
 
 Example:
 
 ```bash
-RUST_LOG=debug STORAGE_DIR=/data OBJECT_STORE_DB=sqlite:///tmp/fs.db cargo run
+RUST_LOG=debug OBJECT_STORE_STORAGE_DIR=/data/object-data \
+OBJECT_STORE_DATABASE_URL=sqlite:///tmp/object_store.db cargo run
 ```
 
 ---
@@ -153,10 +154,10 @@ cargo clippy
 ## 🧾 Example `.env`
 
 ```bash
-HOST=0.0.0.0
-PORT=8080
-STORAGE_DIR=./storage
-DATABASE_URL=sqlite://object_store.db
+OBJECT_STORE_HOST=0.0.0.0
+OBJECT_STORE_PORT=3000
+OBJECT_STORE_STORAGE_DIR=./data/objects
+OBJECT_STORE_DATABASE_URL=sqlite://./data/meta/object_store.db
 RUST_LOG=info
 ```
 
@@ -196,16 +197,16 @@ CREATE TABLE objects (
 
 ```bash
 # Create a bucket
-curl -X PUT http://localhost:8080/photos
+curl -X PUT http://localhost:3000/photos
 
 # Upload a file
-curl -X PUT --data-binary "@pic.jpg" http://localhost:8080/photos/pic.jpg
+curl -X PUT --data-binary "@pic.jpg" http://localhost:3000/photos/pic.jpg
 
 # List objects
-curl http://localhost:8080/photos
+curl http://localhost:3000/photos
 
 # Download file
-curl -o out.jpg http://localhost:8080/photos/pic.jpg
+curl -o out.jpg http://localhost:3000/photos/pic.jpg
 ```
 
 ---

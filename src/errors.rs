@@ -1,3 +1,4 @@
+use crate::services::storage_service::StorageError;
 use axum::{
     Json,
     http::StatusCode,
@@ -55,5 +56,22 @@ impl IntoResponse for AppError {
 impl From<anyhow::Error> for AppError {
     fn from(err: anyhow::Error) -> Self {
         AppError::internal(err.to_string())
+    }
+}
+
+impl From<StorageError> for AppError {
+    fn from(err: StorageError) -> Self {
+        match err {
+            StorageError::BucketNotFound(_) | StorageError::ObjectNotFound { .. } => {
+                AppError::not_found(err.to_string())
+            }
+            StorageError::BucketAlreadyExists(_) => {
+                AppError::new(StatusCode::CONFLICT, err.to_string())
+            }
+            StorageError::InvalidObjectKey => {
+                AppError::new(StatusCode::BAD_REQUEST, err.to_string())
+            }
+            StorageError::Sqlx(_) | StorageError::Io(_) => AppError::internal(err.to_string()),
+        }
     }
 }
