@@ -1,2 +1,39 @@
-/target
-/data
+# === Rust / Cargo ===
+/target/
+**/*.rs.bk
+Cargo.lock
+# (Uncomment below if you want to lock dependencies in apps, not libraries)
+# !Cargo.lock
+
+# === Local runtime data ===
+/data/
+*.db
+*.sqlite
+*.sqlite3
+
+# === Logs & temp ===
+*.log
+*.tmp
+*.swp
+*.bak
+*.old
+
+# === Environment / secrets ===
+.env
+.env.*
+!.env.example
+
+# === OS / Editor files ===
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.iml
+
+# === Coverage / testing ===
+/coverage/
+*.profraw
+*.profdata
+
+# === Miscellaneous ===
+/node_modules/
