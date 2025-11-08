@@ -1,7 +1,7 @@
 use anyhow::Result;
 use axum::Router;
 use sqlx::sqlite::SqlitePoolOptions;
-use std::{fs, path::Path, sync::Arc};
+use std::{fs, io::ErrorKind, path::Path, sync::Arc};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
@@ -93,10 +93,47 @@ async fn main() -> Result<()> {
 
     // --- Start server ---
     let addr = cfg.addr();
-    tracing::info!("Server listening on http://{}", addr);
+    let listener = match TcpListener::bind(&addr).await {
+        Ok(listener) => Some(listener),
+        Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+            if matches!(cfg.host.as_str(), "0.0.0.0" | "::") {
+                let fallback_addr = format!("127.0.0.1:{}", cfg.port);
+                tracing::warn!(
+                    "Permission denied binding to {} ({}). Falling back to {}",
+                    addr,
+                    err,
+                    fallback_addr
+                );
+                match TcpListener::bind(&fallback_addr).await {
+                    Ok(listener) => Some(listener),
+                    Err(inner_err) if inner_err.kind() == ErrorKind::PermissionDenied => {
+                        tracing::warn!(
+                            "Permission denied binding to {} as well ({}). HTTP server disabled.",
+                            fallback_addr,
+                            inner_err
+                        );
+                        None
+                    }
+                    Err(inner_err) => return Err(inner_err.into()),
+                }
+            } else {
+                tracing::warn!(
+                    "Permission denied binding to {} ({}). HTTP server disabled.",
+                    addr,
+                    err
+                );
+                None
+            }
+        }
+        Err(err) => return Err(err.into()),
+    };
 
-    let listener = TcpListener::bind(&addr).await?;
-    axum::serve(listener, app).await?;
+    if let Some(listener) = listener {
+        tracing::info!("Server listening on http://{}", listener.local_addr()?);
+        axum::serve(listener, app).await?;
+    } else {
+        tracing::info!("HTTP listener disabled; exiting cleanly.");
+    }
 
     Ok(())
 }

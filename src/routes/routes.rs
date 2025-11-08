@@ -2,15 +2,15 @@
 //!
 //! ## Structure
 //! - **Bucket-level endpoints**
-//!   - `GET    /:bucket` — list objects (supports prefix, delimiter, max-keys)
-//!   - `PUT    /:bucket` — create bucket
-//!   - `DELETE /:bucket` — delete bucket
+//!   - `GET    /{bucket}` — list objects (supports prefix, delimiter, max-keys)
+//!   - `PUT    /{bucket}` — create bucket
+//!   - `DELETE /{bucket}` — delete bucket
 //!
 //! - **Object-level endpoints**
-//!   - `PUT    /:bucket/*key` — upload object
-//!   - `GET    /:bucket/*key` — download object
-//!   - `HEAD   /:bucket/*key` — retrieve metadata only
-//!   - `DELETE /:bucket/*key` — soft-delete object
+//!   - `PUT    /{bucket}/{*key}` — upload object
+//!   - `GET    /{bucket}/{*key}` — download object
+//!   - `HEAD   /{bucket}/{*key}` — retrieve metadata only
+//!   - `DELETE /{bucket}/{*key}` — soft-delete object
 //!
 //! The wildcard `*key` allows nested keys like `photos/2025/img.jpg`.
 
@@ -40,7 +40,7 @@ pub fn routes() -> Router<StorageService> {
         .route("/readyz", get(readyz))
         // Object-level routes
         .route(
-            "/:bucket/*key",
+            "/{bucket}/{*key}",
             put(upload_object)
                 .get(get_object)
                 .head(head_object)
@@ -48,7 +48,7 @@ pub fn routes() -> Router<StorageService> {
         )
         // Bucket-level routes
         .route(
-            "/:bucket",
+            "/{bucket}",
             get(list_objects).put(create_bucket).delete(delete_bucket),
         )
 }
