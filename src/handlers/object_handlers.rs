@@ -2,27 +2,38 @@
 //! Streams object bodies to avoid buffering in memory and delegates storage
 //! concerns to `StorageService`.
 
-use crate::{errors::AppError, models::object::Object, services::storage_service::StorageService};
+use crate::{
+    errors::AppError,
+    models::object::Object,
+    services::storage_service::{ListObjectsParams, ListObjectsResult, StorageService},
+};
 use axum::{
     Json,
     body::Body,
     extract::{Path, Query, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
+use base64::{Engine as _, engine::general_purpose};
+use chrono::SecondsFormat;
 use futures::StreamExt;
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-use std::{collections::HashSet, io};
+use serde::Deserialize;
+use std::io;
 use tokio_util::io::ReaderStream;
 
-/// Query params accepted by `GET /{bucket}` (list objects)
+/// Query params accepted by ListObjectsV2.
 #[derive(Debug, Deserialize)]
-pub struct ListQuery {
+pub struct ListObjectsV2Query {
+    #[serde(rename = "list-type")]
+    pub list_type: Option<u8>,
     pub prefix: Option<String>,
     pub delimiter: Option<String>,
     #[serde(rename = "max-keys")]
     pub max_keys: Option<usize>,
+    #[serde(rename = "continuation-token")]
+    pub continuation_token: Option<String>,
+    #[serde(rename = "start-after")]
+    pub start_after: Option<String>,
 }
 
 /// Minimal request body for `PUT /{bucket}` (create bucket).
@@ -30,19 +41,6 @@ pub struct ListQuery {
 pub struct CreateBucketReq {
     #[serde(rename = "LocationConstraint")]
     pub location_constraint: Option<String>,
-}
-
-/// Response shape for list objects (S3-like subset)
-#[derive(Debug, Serialize)]
-struct ListObjectsResponse {
-    is_truncated: bool,
-    contents: Vec<Value>,
-    name: String,
-    prefix: String,
-    delimiter: Option<String>,
-    max_keys: usize,
-    common_prefixes: Vec<Value>,
-    key_count: usize,
 }
 
 /// Upload an object to `/{bucket}/{*key}`.
@@ -73,12 +71,10 @@ pub async fn upload_object(
         }
     }
 
-    let body = Json(json!({
-        "ETag": etag,
-        "VersionId": object.version_id,
-    }));
-
-    Ok((StatusCode::CREATED, resp_headers, body))
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::OK;
+    *response.headers_mut() = resp_headers;
+    Ok(response)
 }
 
 /// Download an object `/{bucket}/{*key}` as a streaming response.
@@ -114,90 +110,80 @@ pub async fn head_object(
 pub async fn delete_object(
     State(service): State<StorageService>,
     Path((bucket, key)): Path<(String, String)>,
-) -> Result<impl IntoResponse, AppError> {
-    service.delete_object(&bucket, &key).await?;
-    Ok(StatusCode::NO_CONTENT)
+) -> Result<Response, AppError> {
+    let _meta = service.delete_object(&bucket, &key).await?;
+
+    let xml = format!(
+        concat!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>"#,
+            r#"<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">"#,
+            r#"<Deleted>"#,
+            r#"<Key>{}</Key>"#,
+            r#"<DeleteMarker>true</DeleteMarker>"#,
+            r#"</Deleted></DeleteResult>"#
+        ),
+        xml_escape(&key)
+    );
+
+    let mut response = Response::new(Body::from(xml));
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/xml"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-amz-delete-marker"),
+        HeaderValue::from_static("true"),
+    );
+    *response.status_mut() = StatusCode::NO_CONTENT;
+    Ok(response)
 }
 
 /// GET `/{bucket}` — list objects, supports ?prefix=&delimiter=&max-keys=
 pub async fn list_objects(
     State(service): State<StorageService>,
     Path(bucket): Path<String>,
-    Query(q): Query<ListQuery>,
-) -> Result<impl IntoResponse, AppError> {
-    let prefix = q.prefix.clone();
-    let delimiter = q.delimiter.clone();
-    let max_keys = q.max_keys.unwrap_or(1000);
-
-    let objs = service.list_objects(&bucket, prefix.clone()).await?;
-
-    let mut common_prefixes = HashSet::<String>::new();
-    let mut contents = Vec::<Value>::new();
-
-    for obj in &objs {
-        let key = &obj.key;
-
-        if let Some(ref delim) = delimiter {
-            let after_prefix = if let Some(ref p) = prefix {
-                if key.starts_with(p) {
-                    &key[p.len()..]
-                } else {
-                    key.as_str()
-                }
-            } else {
-                key.as_str()
-            };
-
-            if let Some(pos) = after_prefix.find(delim) {
-                let cp = if let Some(ref p) = prefix {
-                    format!("{}{}", p, &after_prefix[..pos + delim.len()])
-                } else {
-                    after_prefix[..pos + delim.len()].to_string()
-                };
-                common_prefixes.insert(cp);
-                continue;
-            }
-        }
-
-        contents.push(json!({
-            "Key": &obj.key,
-            "LastModified": obj.last_modified.to_rfc3339(),
-            "ETag": obj.etag.as_ref().map(|e| format!("\"{}\"", e)),
-            "Size": obj.size_bytes,
-            "StorageClass": &obj.storage_class,
-        }));
+    Query(q): Query<ListObjectsV2Query>,
+) -> Result<Response, AppError> {
+    let list_type = q.list_type.unwrap_or(2);
+    if list_type != 2 {
+        return Err(AppError::new(
+            StatusCode::BAD_REQUEST,
+            "Only list-type=2 is supported",
+        ));
     }
 
-    contents.sort_by(|a, b| a["Key"].as_str().cmp(&b["Key"].as_str()));
-    let mut cps: Vec<Value> = common_prefixes
-        .into_iter()
-        .map(|p| json!({ "Prefix": p }))
-        .collect();
-    cps.sort_by(|a, b| a["Prefix"].as_str().cmp(&b["Prefix"].as_str()));
+    let continuation_token_raw = q.continuation_token.clone();
+    let continuation_decoded = continuation_token_raw
+        .as_deref()
+        .map(decode_continuation_token);
+    let start_after = q.start_after.clone();
+    let max_keys = q.max_keys.unwrap_or(1000).clamp(1, 1000);
 
-    let mut is_truncated = false;
-    if contents.len() > max_keys {
-        is_truncated = true;
-        contents.truncate(max_keys);
-    }
-    if cps.len() > max_keys {
-        is_truncated = true;
-        cps.truncate(max_keys);
-    }
-
-    let key_count = contents.len();
-    let resp = ListObjectsResponse {
-        is_truncated,
-        contents,
-        name: bucket.clone(),
-        prefix: prefix.unwrap_or_default(),
-        delimiter,
+    let params = ListObjectsParams {
+        prefix: q.prefix.clone(),
+        delimiter: q.delimiter.clone(),
+        continuation_token: continuation_decoded,
+        start_after: start_after.clone(),
         max_keys,
-        common_prefixes: cps,
-        key_count,
     };
 
-    Ok((StatusCode::OK, Json(json!(resp))))
+    let result = service.list_objects_v2(&bucket, params.clone()).await?;
+    let xml = build_list_objects_v2_xml(
+        &bucket,
+        &params,
+        continuation_token_raw.as_deref(),
+        start_after.as_deref(),
+        &result,
+    );
+
+    let mut response = Response::new(Body::from(xml));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/xml"),
+    );
+    *response.status_mut() = StatusCode::OK;
+    Ok(response)
 }
 
 /// PUT `/{bucket}` — create bucket.
@@ -212,10 +198,21 @@ pub async fn create_bucket(
 
     service.create_bucket(&bucket, region).await?;
 
-    Ok((
-        StatusCode::OK,
-        Json(json!({ "Location": format!("/{}", bucket) })),
-    ))
+    let xml = format!(
+        concat!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>"#,
+            r#"<CreateBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">"#,
+            r#"<Location>/{}</Location>"#,
+            r#"</CreateBucketResult>"#
+        ),
+        xml_escape(&bucket)
+    );
+    let mut response = Response::new(Body::from(xml));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/xml"),
+    );
+    Ok(response)
 }
 
 /// DELETE `/{bucket}` — delete bucket.
@@ -257,4 +254,94 @@ fn set_object_headers(headers: &mut HeaderMap, meta: &Object, len_override: Opti
         HeaderValue::from_str(&meta.last_modified.to_rfc2822())
             .unwrap_or_else(|_| HeaderValue::from_static("")),
     );
+}
+
+fn build_list_objects_v2_xml(
+    bucket: &str,
+    params: &ListObjectsParams,
+    continuation_token: Option<&str>,
+    start_after: Option<&str>,
+    result: &ListObjectsResult,
+) -> String {
+    let mut xml = String::from(
+        r#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">"#,
+    );
+    xml.push_str(&format!("<Name>{}</Name>", xml_escape(bucket)));
+    xml.push_str(&format!(
+        "<Prefix>{}</Prefix>",
+        xml_escape(params.prefix.as_deref().unwrap_or(""))
+    ));
+    xml.push_str(&format!("<MaxKeys>{}</MaxKeys>", params.max_keys));
+    xml.push_str(&format!("<KeyCount>{}</KeyCount>", result.key_count));
+    if let Some(token) = continuation_token {
+        xml.push_str(&format!(
+            "<ContinuationToken>{}</ContinuationToken>",
+            xml_escape(token)
+        ));
+    }
+    if let Some(sa) = start_after {
+        xml.push_str(&format!("<StartAfter>{}</StartAfter>", xml_escape(sa)));
+    }
+    if let Some(delim) = &params.delimiter {
+        xml.push_str(&format!("<Delimiter>{}</Delimiter>", xml_escape(delim)));
+    }
+    xml.push_str(&format!(
+        "<IsTruncated>{}</IsTruncated>",
+        if result.is_truncated { "true" } else { "false" }
+    ));
+    if let Some(next) = &result.next_continuation_token {
+        let encoded = encode_continuation_token(next);
+        xml.push_str(&format!(
+            "<NextContinuationToken>{}</NextContinuationToken>",
+            xml_escape(&encoded)
+        ));
+    }
+
+    for obj in &result.objects {
+        xml.push_str("<Contents>");
+        xml.push_str(&format!("<Key>{}</Key>", xml_escape(&obj.key)));
+        xml.push_str(&format!(
+            "<LastModified>{}</LastModified>",
+            obj.last_modified
+                .to_rfc3339_opts(SecondsFormat::Millis, true)
+        ));
+        let etag = obj.etag.as_deref().unwrap_or("");
+        xml.push_str(&format!("<ETag>\"{}\"</ETag>", xml_escape(etag)));
+        xml.push_str(&format!("<Size>{}</Size>", obj.size_bytes));
+        xml.push_str(&format!(
+            "<StorageClass>{}</StorageClass>",
+            xml_escape(&obj.storage_class)
+        ));
+        xml.push_str("</Contents>");
+    }
+
+    for prefix in &result.common_prefixes {
+        xml.push_str("<CommonPrefixes><Prefix>");
+        xml.push_str(&xml_escape(prefix));
+        xml.push_str("</Prefix></CommonPrefixes>");
+    }
+
+    xml.push_str("</ListBucketResult>");
+    xml
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn encode_continuation_token(token: &str) -> String {
+    general_purpose::STANDARD.encode(token)
+}
+
+fn decode_continuation_token(token: &str) -> String {
+    general_purpose::STANDARD
+        .decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .unwrap_or_else(|| token.to_string())
 }

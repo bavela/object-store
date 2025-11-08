@@ -31,29 +31,3 @@ CREATE INDEX IF NOT EXISTS idx_objects_bucket_key ON objects(bucket_id, key);
 
 CREATE INDEX IF NOT EXISTS idx_objects_bucket_key_deleted ON objects(bucket_id, is_deleted);
 
-CREATE TABLE IF NOT EXISTS multipart_uploads (
-  id TEXT PRIMARY KEY,
-  bucket_id TEXT NOT NULL REFERENCES buckets(id) ON DELETE CASCADE,
-  key TEXT NOT NULL,
-  upload_id TEXT NOT NULL UNIQUE,
-  initiated_at TEXT NOT NULL,
-  completed INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS multipart_parts (
-  id TEXT PRIMARY KEY,
-  upload_id TEXT NOT NULL REFERENCES multipart_uploads(id) ON DELETE CASCADE,
-  part_number INTEGER NOT NULL,
-  size_bytes INTEGER NOT NULL,
-  etag TEXT NOT NULL,
-  uploaded_at TEXT NOT NULL,
-  UNIQUE(upload_id, part_number)
-);
-
-CREATE TABLE IF NOT EXISTS object_metadata (
-  id TEXT PRIMARY KEY,
-  object_id TEXT NOT NULL REFERENCES objects(id) ON DELETE CASCADE,
-  key TEXT NOT NULL,
-  value TEXT NOT NULL,
-  UNIQUE(object_id, key)
-);

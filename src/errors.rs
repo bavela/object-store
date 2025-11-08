@@ -1,10 +1,10 @@
 use crate::services::storage_service::StorageError;
 use axum::{
-    Json,
     http::StatusCode,
     response::{IntoResponse, Response},
+    Json,
 };
-use serde_json::json;
+use serde::Serialize;
 use std::fmt;
 
 /// A lightweight wrapper for general errors that keeps the message local.
@@ -44,12 +44,12 @@ impl std::error::Error for AppError {}
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        let body = Json(json!({
-            "error": self.message,
-            "status": self.status.as_u16()
-        }));
+        let body = ErrorBody {
+            error: self.message,
+            status: self.status.as_u16(),
+        };
 
-        (self.status, body).into_response()
+        (self.status, Json(body)).into_response()
     }
 }
 
@@ -74,4 +74,10 @@ impl From<StorageError> for AppError {
             StorageError::Sqlx(_) | StorageError::Io(_) => AppError::internal(err.to_string()),
         }
     }
+}
+
+#[derive(Serialize)]
+struct ErrorBody {
+    error: String,
+    status: u16,
 }

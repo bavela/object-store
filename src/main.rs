@@ -32,22 +32,22 @@ async fn main() -> Result<()> {
 
     // --- Initialize SQLite connection ---
     let db_url = &cfg.database_url;
-    println!("DEBUG: Connecting using raw URL => {}", db_url);
+    tracing::debug!("Connecting using raw URL => {}", db_url);
 
     // Extract the local file path SQLx will use
     let db_path = db_url
         .trim_start_matches("sqlite://")
         .trim_start_matches("file:");
-    println!("DEBUG: Interpreted SQLite path => {}", db_path);
+    tracing::debug!("Interpreted SQLite path => {}", db_path);
 
     // Check filesystem state before connecting
     let db_path_obj = Path::new(db_path);
-    println!(
-        "DEBUG: Absolute path => {:?}",
+    tracing::debug!(
+        "Absolute path => {:?}",
         std::fs::canonicalize(db_path_obj).ok()
     );
-    println!(
-        "DEBUG: Exists? {}, Is file? {}, Parent exists? {}",
+    tracing::debug!(
+        "Exists? {}, Is file? {}, Parent exists? {}",
         db_path_obj.exists(),
         db_path_obj.is_file(),
         db_path_obj.parent().map(|p| p.exists()).unwrap_or(false)
@@ -57,7 +57,7 @@ async fn main() -> Result<()> {
     if let Some(parent) = db_path_obj.parent() {
         if !parent.exists() {
             std::fs::create_dir_all(parent)?;
-            println!("DEBUG: Created missing directory {:?}", parent);
+            tracing::info!("Created missing directory {:?}", parent);
         }
     }
 
@@ -67,8 +67,8 @@ async fn main() -> Result<()> {
         .write(true)
         .open(db_path)
     {
-        Ok(_) => println!("DEBUG: File can be created/opened successfully."),
-        Err(e) => println!("DEBUG: Failed to open file manually: {}", e),
+        Ok(_) => tracing::debug!("File can be created/opened successfully."),
+        Err(e) => tracing::warn!("Failed to open file manually: {}", e),
     }
 
     let db: Arc<sqlx::Pool<sqlx::Sqlite>> = Arc::new(
@@ -95,46 +95,25 @@ async fn main() -> Result<()> {
     // --- Start server ---
     let addr = cfg.addr();
     let listener = match TcpListener::bind(&addr).await {
-        Ok(listener) => Some(listener),
-        Err(err) if err.kind() == ErrorKind::PermissionDenied => {
-            if matches!(cfg.host.as_str(), "0.0.0.0" | "::") {
-                let fallback_addr = format!("127.0.0.1:{}", cfg.port);
-                tracing::warn!(
-                    "Permission denied binding to {} ({}). Falling back to {}",
-                    addr,
-                    err,
-                    fallback_addr
-                );
-                match TcpListener::bind(&fallback_addr).await {
-                    Ok(listener) => Some(listener),
-                    Err(inner_err) if inner_err.kind() == ErrorKind::PermissionDenied => {
-                        tracing::warn!(
-                            "Permission denied binding to {} as well ({}). HTTP server disabled.",
-                            fallback_addr,
-                            inner_err
-                        );
-                        None
-                    }
-                    Err(inner_err) => return Err(inner_err.into()),
-                }
-            } else {
-                tracing::warn!(
-                    "Permission denied binding to {} ({}). HTTP server disabled.",
-                    addr,
-                    err
-                );
-                None
-            }
+        Ok(listener) => listener,
+        Err(err)
+            if err.kind() == ErrorKind::PermissionDenied
+                && matches!(cfg.host.as_str(), "0.0.0.0" | "::") =>
+        {
+            let fallback_addr = format!("127.0.0.1:{}", cfg.port);
+            tracing::warn!(
+                "Permission denied binding to {} ({}). Falling back to {}",
+                addr,
+                err,
+                fallback_addr
+            );
+            TcpListener::bind(&fallback_addr).await?
         }
         Err(err) => return Err(err.into()),
     };
 
-    if let Some(listener) = listener {
-        tracing::info!("Server listening on http://{}", listener.local_addr()?);
-        axum::serve(listener, app).await?;
-    } else {
-        tracing::info!("HTTP listener disabled; exiting cleanly.");
-    }
+    tracing::info!("Server listening on http://{}", listener.local_addr()?);
+    axum::serve(listener, app).await?;
 
     Ok(())
 }
