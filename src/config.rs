@@ -1,3 +1,4 @@
+use anyhow::{Context, Result};
 use clap::Parser;
 use std::env;
 
@@ -38,16 +39,19 @@ pub struct Args {
 
 impl AppConfig {
     /// Parse environment variables + CLI args into AppConfig and migrate flag.
-    pub fn from_env_and_args() -> (Self, bool) {
+    pub fn from_env_and_args() -> Result<(Self, bool)> {
         // Parse CLI once
         let args = Args::parse();
 
         // --- Environment fallback ---
         let env_host = env::var("OBJECT_STORE_HOST").unwrap_or_else(|_| "0.0.0.0".into());
-        let env_port = env::var("OBJECT_STORE_PORT")
-            .ok()
-            .and_then(|v| v.parse::<u16>().ok())
-            .unwrap_or(3000);
+        let env_port = match env::var("OBJECT_STORE_PORT") {
+            Ok(value) => value
+                .parse::<u16>()
+                .with_context(|| format!("parsing OBJECT_STORE_PORT value `{}`", value))?,
+            Err(env::VarError::NotPresent) => 3000,
+            Err(err) => return Err(err).context("reading OBJECT_STORE_PORT"),
+        };
         let env_storage =
             env::var("OBJECT_STORE_STORAGE_DIR").unwrap_or_else(|_| "./data/objects".into());
         let env_db = env::var("OBJECT_STORE_DATABASE_URL")
@@ -61,7 +65,7 @@ impl AppConfig {
             database_url: args.database_url.unwrap_or(env_db),
         };
 
-        (cfg, args.migrate)
+        Ok((cfg, args.migrate))
     }
 
     pub fn addr(&self) -> String {

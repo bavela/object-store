@@ -1,8 +1,8 @@
 use crate::services::storage_service::StorageError;
 use axum::{
+    Json,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use serde::Serialize;
 use std::fmt;
@@ -69,6 +69,12 @@ impl From<StorageError> for AppError {
                 AppError::new(StatusCode::CONFLICT, err.to_string())
             }
             StorageError::InvalidObjectKey => {
+                AppError::new(StatusCode::BAD_REQUEST, err.to_string())
+            }
+            StorageError::InvalidBucketName { .. } => {
+                AppError::new(StatusCode::BAD_REQUEST, err.to_string())
+            }
+            StorageError::UnsupportedRegion(_) => {
                 AppError::new(StatusCode::BAD_REQUEST, err.to_string())
             }
             StorageError::Sqlx(_) | StorageError::Io(_) => AppError::internal(err.to_string()),

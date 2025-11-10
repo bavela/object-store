@@ -49,6 +49,10 @@ pub enum StorageError {
     BucketNotFound(String),
     #[error("bucket `{0}` already exists")]
     BucketAlreadyExists(String),
+    #[error("bucket `{name}` invalid: {reason}")]
+    InvalidBucketName { name: String, reason: String },
+    #[error("region `{0}` is not supported")]
+    UnsupportedRegion(String),
     #[error("object `{key}` not found in bucket `{bucket}`")]
     ObjectNotFound { bucket: String, key: String },
     #[error("invalid object key")]
@@ -79,6 +83,28 @@ pub struct StorageService {
     pub base_path: PathBuf,
 }
 
+const MAX_OBJECT_KEY_LEN: usize = 1024;
+const BUCKET_NAME_MIN_LEN: usize = 3;
+const BUCKET_NAME_MAX_LEN: usize = 63;
+const SUPPORTED_REGIONS: [&str; 16] = [
+    "local",
+    "us-east-1",
+    "us-east-2",
+    "us-west-1",
+    "us-west-2",
+    "eu-west-1",
+    "ap-southeast-1",
+    "ap-northeast-1",
+    "ap-south-1",
+    "ap-south-2",
+    "ap-southeast-2",
+    "ap-southeast-3",
+    "ap-southeast-4",
+    "ap-northeast-2",
+    "ap-northeast-3",
+    "me-south-1",
+];
+
 impl StorageService {
     /// Create a new StorageService backed by the provided SQLite pool and
     /// using `base_path` as the root directory for object payloads.
@@ -95,23 +121,125 @@ impl StorageService {
     /// simple — you should replace it with a more robust sanitizer if you
     /// accept untrusted keys.
     fn ensure_key_safe(&self, key: &str) -> StorageResult<()> {
-        if key.contains("..") || key.starts_with('/') {
+        if key.is_empty() {
+            return Err(StorageError::InvalidObjectKey);
+        }
+        if key.len() > MAX_OBJECT_KEY_LEN {
+            return Err(StorageError::InvalidObjectKey);
+        }
+        if key.starts_with('/') || key.contains("..") {
+            return Err(StorageError::InvalidObjectKey);
+        }
+        if key
+            .bytes()
+            .any(|b| b.is_ascii_control() || b == b'\\' || b == b'\0')
+        {
             return Err(StorageError::InvalidObjectKey);
         }
         Ok(())
     }
 
+    /// Validate bucket name format.
+    ///
+    /// Enforces S3-like naming rules:
+    /// - 3–63 characters
+    /// - lowercase letters, digits, dots, hyphens only
+    /// - cannot start/end with dot or hyphen
+    /// - cannot contain consecutive dots or dot-hyphen patterns
+    /// - cannot look like an IPv4 address
+    ///
+    /// Ensures predictable directory structure and prevents invalid inputs.
+    fn ensure_bucket_name_safe(&self, name: &str) -> StorageResult<()> {
+        let trimmed = name.trim();
+        if trimmed != name {
+            return Err(StorageError::InvalidBucketName {
+                name: name.to_string(),
+                reason: "cannot begin or end with whitespace".into(),
+            });
+        }
+
+        let len = name.len();
+        if len < BUCKET_NAME_MIN_LEN || len > BUCKET_NAME_MAX_LEN {
+            return Err(StorageError::InvalidBucketName {
+                name: name.to_string(),
+                reason: "must be between 3 and 63 characters".into(),
+            });
+        }
+
+        if !name
+            .chars()
+            .all(|c| matches!(c, 'a'..='z' | '0'..='9' | '.' | '-'))
+        {
+            return Err(StorageError::InvalidBucketName {
+                name: name.to_string(),
+                reason: "allowed characters are lowercase letters, digits, dots, and hyphens"
+                    .into(),
+            });
+        }
+
+        if name.starts_with('.')
+            || name.ends_with('.')
+            || name.starts_with('-')
+            || name.ends_with('-')
+        {
+            return Err(StorageError::InvalidBucketName {
+                name: name.to_string(),
+                reason: "must start and end with a lowercase letter or digit".into(),
+            });
+        }
+
+        if name.contains("..") || name.contains("-.") || name.contains(".-") {
+            return Err(StorageError::InvalidBucketName {
+                name: name.to_string(),
+                reason: "cannot contain consecutive dots or dot-hyphen combinations".into(),
+            });
+        }
+
+        if is_ipv4_like(name) {
+            return Err(StorageError::InvalidBucketName {
+                name: name.to_string(),
+                reason: "must not be formatted like an IP address".into(),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Validate region string against SUPPORTED_REGIONS.
+    ///
+    /// Case-insensitive comparison. Returns UnsupportedRegion on mismatch.
+    fn ensure_region_valid(&self, region: &str) -> StorageResult<()> {
+        if SUPPORTED_REGIONS
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(region))
+        {
+            Ok(())
+        } else {
+            Err(StorageError::UnsupportedRegion(region.to_string()))
+        }
+    }
+    /// Compute the physical base folder path for a bucket.
+    ///
+    /// This does not check for existence. Used for building object paths.
     fn bucket_root(&self, bucket_name: &str) -> PathBuf {
         let mut path = self.base_path.clone();
         path.push(bucket_name);
         path
     }
 
+    /// Generate two-level shard identifiers for an object key.
+    ///
+    /// Uses MD5(bucket/key) and returns the first two bytes as lowercase
+    /// hexadecimal strings (00–ff). Reduces file count per directory.
     fn object_shards(bucket_name: &str, key: &str) -> (String, String) {
         let digest = md5::compute(format!("{}/{}", bucket_name, key));
         (format!("{:02x}", digest[0]), format!("{:02x}", digest[1]))
     }
 
+    /// Construct a fully-qualified object payload path.
+    ///
+    /// Combines base_path/bucket/{shard}/{shard}/{key}.
+    /// Parent directories may not exist yet.
     fn object_path(&self, bucket_name: &str, key: &str) -> PathBuf {
         let (shard_a, shard_b) = Self::object_shards(bucket_name, key);
         let mut path = self.bucket_root(bucket_name);
@@ -121,7 +249,12 @@ impl StorageService {
         path
     }
 
+    /// Fetch bucket metadata from SQLite.
+    ///
+    /// Returns BucketNotFound if missing.
+    /// Validates bucket name before querying.
     async fn fetch_bucket(&self, bucket: &str) -> StorageResult<Bucket> {
+        self.ensure_bucket_name_safe(bucket)?;
         sqlx::query_as::<sqlx::sqlite::Sqlite, Bucket>(
             "SELECT id, name, owner_id, region, created_at, versioning_enabled
              FROM buckets WHERE name = ?",
@@ -135,6 +268,10 @@ impl StorageService {
         })
     }
 
+    /// Fetch a non-deleted object metadata record.
+    ///
+    /// Queries SQLite by key and bucket_id.
+    /// Returns ObjectNotFound if record missing or marked deleted.
     async fn fetch_object(&self, bucket: &Bucket, key: &str) -> StorageResult<Object> {
         sqlx::query_as::<_, Object>(
             "SELECT id, bucket_id, key, filename, content_type, size_bytes, etag,
@@ -155,8 +292,14 @@ impl StorageService {
         })
     }
 
-    /// Upload an object by streaming the request body to disk while computing
-    /// metadata. This avoids buffering the entire payload in memory.
+    /// Stream-upload an object to disk and update metadata.
+    ///
+    /// - Writes bytes incrementally to a temporary file.
+    /// - Computes MD5/etag and size while streaming.
+    /// - Atomically renames into final location.
+    /// - Upserts metadata row (S3-like overwrite semantics).
+    ///
+    /// Ensures durable writes (fsync) and cleans up temp files on errors.
     pub async fn upload_object_stream<S>(
         &self,
         bucket: &str,
@@ -263,7 +406,10 @@ impl StorageService {
         }
     }
 
-    /// Return object metadata plus a readable file handle for streaming.
+    /// Fetch an object for reading.
+    ///
+    /// Returns metadata and an opened File handle ready for streaming out.
+    /// Returns ObjectNotFound if metadata exists but physical file is missing.
     pub async fn get_object_reader(
         &self,
         bucket: &str,
@@ -288,14 +434,25 @@ impl StorageService {
         Ok((object, file))
     }
 
-    /// Fetch object metadata only (no file I/O).
+    /// Fetch only object metadata.
+    ///
+    /// Verifies key format and bucket existence first.
     pub async fn get_object_metadata(&self, bucket: &str, key: &str) -> StorageResult<Object> {
         self.ensure_key_safe(key)?;
         let bucket_rec = self.fetch_bucket(bucket).await?;
         self.fetch_object(&bucket_rec, key).await
     }
 
-    /// List objects following the ListObjectsV2 semantics.
+    /// List objects following S3 ListObjectsV2 rules.
+    ///
+    /// Supports:
+    /// - prefix filtering
+    /// - delimiter grouping
+    /// - continuation tokens
+    /// - lexicographical ordering
+    /// - soft-deleted filtering
+    ///
+    /// Returns objects, common prefixes, truncation status, and next token.
     pub async fn list_objects_v2(
         &self,
         bucket: &str,
@@ -366,9 +523,13 @@ impl StorageService {
         })
     }
 
-    /// Soft-delete an object (sets `is_deleted = 1`) and attempt to remove
-    /// the on-disk payload. File removal errors are logged but not returned,
-    /// preserving idempotence when removing already-missing files.
+    /// Soft-delete an object and attempt to remove its payload.
+    ///
+    /// - Sets `is_deleted = 1`
+    /// - Deletes physical file best-effort
+    /// - Prunes empty bucket directories
+    ///
+    /// Idempotent: repeated calls return ObjectNotFound if already deleted.
     pub async fn delete_object(&self, bucket: &str, key: &str) -> StorageResult<Object> {
         self.ensure_key_safe(key)?;
         let bucket_rec = self.fetch_bucket(bucket).await?;
@@ -405,8 +566,16 @@ impl StorageService {
         Ok(object)
     }
 
-    /// Create a new bucket row if it does not already exist.
+    /// Create a bucket and initialize its directory.
+    ///
+    /// Validates name and region. Inserts metadata row.
+    /// Returns BucketAlreadyExists if name conflict occurs.
+    ///
+    /// Creates the bucket folder on disk.
     pub async fn create_bucket(&self, name: &str, region: String) -> StorageResult<Bucket> {
+        self.ensure_bucket_name_safe(name)?;
+        let normalized_region = region.to_lowercase();
+        self.ensure_region_valid(&normalized_region)?;
         let bucket_root = self.bucket_root(name);
         fs::create_dir_all(&bucket_root).await?;
 
@@ -414,7 +583,7 @@ impl StorageService {
             id: Uuid::new_v4(),
             name: name.to_string(),
             owner_id: Uuid::new_v4(),
-            region,
+            region: normalized_region.clone(),
             created_at: Utc::now(),
             versioning_enabled: false,
         };
@@ -426,7 +595,7 @@ impl StorageService {
         .bind(bucket.id)
         .bind(&bucket.name)
         .bind(bucket.owner_id)
-        .bind(&bucket.region)
+        .bind(&normalized_region)
         .bind(bucket.created_at)
         .bind(bucket.versioning_enabled)
         .execute(&*self.db)
@@ -440,8 +609,15 @@ impl StorageService {
         }
     }
 
-    /// Delete a bucket and try to remove its directory from disk.
+    /// Delete a bucket from metadata and filesystem.
+    ///
+    /// - Removes metadata row
+    /// - Attempts to recursively delete bucket directory
+    /// - Ignores missing directory errors
+    ///
+    /// Returns BucketNotFound if DB row missing.
     pub async fn delete_bucket(&self, name: &str) -> StorageResult<()> {
+        self.ensure_bucket_name_safe(name)?;
         let result = sqlx::query("DELETE FROM buckets WHERE name = ?")
             .bind(name)
             .execute(&*self.db)
@@ -465,6 +641,13 @@ impl StorageService {
         Ok(())
     }
 
+    /// Recursively remove empty directories up to bucket root.
+    ///
+    /// Stops when:
+    /// - directory not empty
+    /// - directory not found
+    /// - reached root
+    /// - encountered unexpected I/O errors
     async fn prune_empty_dirs(&self, start: &Path, stop: &Path) {
         let mut current = start.to_path_buf();
         while current.starts_with(stop) && current != stop {
@@ -487,6 +670,7 @@ impl StorageService {
     }
 }
 
+/// Return true if SQLx error indicates a unique constraint violation.
 fn is_unique_violation(err: &sqlx::Error) -> bool {
     matches!(
         err,
@@ -494,6 +678,10 @@ fn is_unique_violation(err: &sqlx::Error) -> bool {
     )
 }
 
+/// Compute a synthetic "common prefix" for S3 list semantics.
+///
+/// Used only when a delimiter is provided. Returns Some(prefix) if the key
+/// belongs to a grouped prefix, otherwise None.
 fn compute_common_prefix(
     key: &str,
     requested_prefix: Option<&str>,
@@ -519,4 +707,25 @@ fn compute_common_prefix(
     } else {
         None
     }
+}
+
+/// Check if a string matches IPv4-like dotted decimal form.
+/// Rejects names formatted like `1.2.3.4`.
+fn is_ipv4_like(name: &str) -> bool {
+    let parts: Vec<&str> = name.split('.').collect();
+    if parts.len() != 4 {
+        return false;
+    }
+    for segment in parts {
+        if segment.is_empty() || segment.len() > 3 {
+            return false;
+        }
+        if segment.chars().any(|c| !c.is_ascii_digit()) {
+            return false;
+        }
+        if segment.parse::<u8>().is_err() {
+            return false;
+        }
+    }
+    true
 }

@@ -154,9 +154,14 @@ pub async fn list_objects(
     }
 
     let continuation_token_raw = q.continuation_token.clone();
-    let continuation_decoded = continuation_token_raw
-        .as_deref()
-        .map(decode_continuation_token);
+    let continuation_decoded = if let Some(raw_token) = continuation_token_raw.as_deref() {
+        Some(
+            decode_continuation_token(raw_token)
+                .map_err(|msg| AppError::new(StatusCode::BAD_REQUEST, msg))?,
+        )
+    } else {
+        None
+    };
     let start_after = q.start_after.clone();
     let max_keys = q.max_keys.unwrap_or(1000).clamp(1, 1000);
 
@@ -338,10 +343,11 @@ fn encode_continuation_token(token: &str) -> String {
     general_purpose::STANDARD.encode(token)
 }
 
-fn decode_continuation_token(token: &str) -> String {
+fn decode_continuation_token(token: &str) -> Result<String, &'static str> {
     general_purpose::STANDARD
         .decode(token)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .unwrap_or_else(|| token.to_string())
+        .map_err(|_| "continuation token is not valid base64")
+        .and_then(|bytes| {
+            String::from_utf8(bytes).map_err(|_| "continuation token is not valid UTF-8")
+        })
 }

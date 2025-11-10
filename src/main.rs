@@ -1,7 +1,12 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::Router;
 use sqlx::sqlite::SqlitePoolOptions;
-use std::{fs, io::ErrorKind, path::Path, sync::Arc};
+use std::{
+    fs,
+    io::ErrorKind,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
@@ -15,19 +20,38 @@ mod services;
 #[tokio::main]
 async fn main() -> Result<()> {
     // --- Logging setup ---
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|err| {
+        eprintln!(
+            "WARN: Failed to parse log filter via RUST_LOG/OBJECT_STORE_LOG ({}); defaulting to info.",
+            err
+        );
+        EnvFilter::new("info")
+    });
+    tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
     // --- Parse config + migrate flag ---
-    let (cfg, migrate) = config::AppConfig::from_env_and_args();
+    let (cfg, migrate) =
+        config::AppConfig::from_env_and_args().context("loading configuration from CLI/ENV")?;
 
     tracing::info!("Starting object-store with config: {:?}", cfg);
 
-    // --- Ensure storage directory exists ---
-    if !Path::new(&cfg.storage_dir).exists() {
-        fs::create_dir_all(&cfg.storage_dir)?;
-        tracing::info!("Created storage directory at {}", cfg.storage_dir);
+    // --- Ensure storage directory exists and normalize path ---
+    let storage_path = PathBuf::from(&cfg.storage_dir);
+    let storage_preexisting = storage_path.exists();
+    fs::create_dir_all(&storage_path)
+        .with_context(|| format!("creating storage directory {}", storage_path.display()))?;
+    let storage_dir_canonical =
+        fs::canonicalize(&storage_path).unwrap_or_else(|_| storage_path.clone());
+    if storage_preexisting {
+        tracing::info!(
+            "Using existing storage directory at {}",
+            storage_dir_canonical.display()
+        );
+    } else {
+        tracing::info!(
+            "Created storage directory at {}",
+            storage_dir_canonical.display()
+        );
     }
 
     // --- Initialize SQLite connection ---
@@ -56,7 +80,8 @@ async fn main() -> Result<()> {
     // Create parent directory if needed
     if let Some(parent) = db_path_obj.parent() {
         if !parent.exists() {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating database directory {:?}", parent))?;
             tracing::info!("Created missing directory {:?}", parent);
         }
     }
@@ -75,7 +100,8 @@ async fn main() -> Result<()> {
         SqlitePoolOptions::new()
             .max_connections(5)
             .connect(db_url)
-            .await?,
+            .await
+            .with_context(|| format!("connecting to database at {}", db_url))?,
     );
 
     // --- Handle migration mode ---
@@ -87,7 +113,7 @@ async fn main() -> Result<()> {
 
     // --- Initialize core service ---
     let storage =
-        services::storage_service::StorageService::new(db.clone(), cfg.storage_dir.clone());
+        services::storage_service::StorageService::new(db.clone(), storage_dir_canonical.clone());
 
     // --- Build router ---
     let app: Router = routes::routes::routes().with_state(storage);
@@ -107,9 +133,22 @@ async fn main() -> Result<()> {
                 err,
                 fallback_addr
             );
-            TcpListener::bind(&fallback_addr).await?
+            match TcpListener::bind(&fallback_addr).await {
+                Ok(listener) => listener,
+                Err(fallback_err) => {
+                    tracing::error!(
+                        "Failed to bind to fallback address {} ({}); aborting.",
+                        fallback_addr,
+                        fallback_err
+                    );
+                    return Err(fallback_err.into());
+                }
+            }
         }
-        Err(err) => return Err(err.into()),
+        Err(err) => {
+            tracing::error!("Failed to bind to {}: {}", addr, err);
+            return Err(err.into());
+        }
     };
 
     tracing::info!("Server listening on http://{}", listener.local_addr()?);
@@ -118,27 +157,10 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Run SQLite migrations manually from the embedded SQL file.
+/// Run SQLite migrations with SQLx’s embedded runner so statements can span lines, include
+/// comments, and keep semicolons without manual splitting.
 async fn run_migrations(db: &Arc<sqlx::Pool<sqlx::Sqlite>>) -> Result<()> {
-    let path = "migrations/0001_init.sql";
-
-    if !Path::new(path).exists() {
-        anyhow::bail!("Migration file not found: {}", path);
-    }
-
-    let sql = fs::read_to_string(path)?;
-    let statements = sql
-        .split(';')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>();
-
-    tracing::info!("Running {} migration statements...", statements.len());
-
-    for stmt in statements {
-        tracing::debug!("Executing migration SQL: {}", stmt);
-        sqlx::query(stmt).execute(&**db).await?;
-    }
-
+    tracing::info!("Running embedded SQLx migrations from ./migrations");
+    sqlx::migrate!("./migrations").run(&**db).await?;
     Ok(())
 }

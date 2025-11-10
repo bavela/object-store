@@ -1,12 +1,13 @@
 //! Health & readiness handlers.
 //!
 //! - GET /healthz  -> simple liveness ("ok")
-//! - GET /readyz   -> readiness that checks DB connectivity and disk I/O
+//! - GET /readyz   -> readiness that checks DB connectivity, storage directory metadata,
+//!                   and disk read/write behavior.
 
 use crate::services::storage_service::StorageService;
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Instant};
 use tokio::fs;
 use uuid::Uuid;
 
@@ -26,69 +27,23 @@ pub async fn healthz() -> impl IntoResponse {
 /// `GET /readyz`
 ///
 /// Readiness probe that:
-/// 1. Runs a lightweight query against SQLite (`SELECT 1`).
-/// 2. Performs a best-effort write/read/delete against the service `base_path`.
+/// 1. Validates the metadata database via `SELECT 1`.
+/// 2. Ensures the storage directory exists and is a directory.
+/// 3. Performs a write/read/delete cycle on the storage directory.
 ///
 /// Returns JSON describing each check. HTTP 200 when all checks pass,
 /// HTTP 503 when any check fails.
 pub async fn readyz(State(service): State<StorageService>) -> impl IntoResponse {
-    // 1) SQLite check
-    let sqlite_check = match sqlx::query_scalar::<_, i64>("SELECT 1")
-        .fetch_one(&*service.db)
-        .await
-    {
-        Ok(v) if v == 1 => (true, None::<String>),
-        Ok(v) => (false, Some(format!("unexpected result: {}", v))),
-        Err(e) => (false, Some(format!("error: {}", e))),
-    };
+    let sqlite_check = check_sqlite(&service).await;
+    let storage_dir_check = check_storage_dir(&service.base_path).await;
+    let disk_io_check = check_disk_io(&service.base_path).await;
 
-    // 2) Disk write/read/delete check (use a temp file under base_path)
-    let tmp_path = service
-        .base_path
-        .join(format!(".readyz-{}", Uuid::new_v4()));
-    let disk_check = match fs::write(&tmp_path, b"readyz").await {
-        Ok(_) => match fs::read(&tmp_path).await {
-            Ok(bytes) => {
-                if bytes == b"readyz" {
-                    // try to remove the temp file; ignore removal error but report if it happens
-                    match fs::remove_file(&tmp_path).await {
-                        Ok(_) => (true, None::<String>),
-                        Err(e) => (true, Some(format!("could not remove tmp file: {}", e))),
-                    }
-                } else {
-                    // content mismatch
-                    let _ = fs::remove_file(&tmp_path).await; // best-effort cleanup
-                    (false, Some("file content mismatch".to_string()))
-                }
-            }
-            Err(e) => {
-                let _ = fs::remove_file(&tmp_path).await; // best-effort cleanup
-                (false, Some(format!("could not read tmp file: {}", e)))
-            }
-        },
-        Err(e) => (false, Some(format!("could not write tmp file: {}", e))),
-    };
-
-    // Build response JSON
-    let sqlite_ok = sqlite_check.0;
-    let disk_ok = disk_check.0;
-    let overall_ok = sqlite_ok && disk_ok;
+    let overall_ok = sqlite_check.ok && storage_dir_check.ok && disk_io_check.ok;
 
     let mut checks = HashMap::new();
-    checks.insert(
-        "sqlite",
-        CheckStatus {
-            ok: sqlite_ok,
-            error: sqlite_check.1,
-        },
-    );
-    checks.insert(
-        "disk",
-        CheckStatus {
-            ok: disk_ok,
-            error: disk_check.1,
-        },
-    );
+    checks.insert("sqlite", sqlite_check);
+    checks.insert("storage_dir", storage_dir_check);
+    checks.insert("disk_io", disk_io_check);
 
     let body = ReadyResponse {
         status: if overall_ok {
@@ -104,6 +59,7 @@ pub async fn readyz(State(service): State<StorageService>) -> impl IntoResponse 
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
+
     (status, Json(body))
 }
 
@@ -122,4 +78,100 @@ struct ReadyResponse {
 struct CheckStatus {
     ok: bool,
     error: Option<String>,
+    info: Option<String>,
+    duration_ms: u128,
+}
+
+fn build_check_status(
+    ok: bool,
+    error: Option<String>,
+    info: Option<String>,
+    start: Instant,
+) -> CheckStatus {
+    CheckStatus {
+        ok,
+        error,
+        info,
+        duration_ms: start.elapsed().as_millis(),
+    }
+}
+
+async fn check_sqlite(service: &StorageService) -> CheckStatus {
+    let start = Instant::now();
+    let info = Some("SELECT 1".to_string());
+    match sqlx::query_scalar::<_, i64>("SELECT 1")
+        .fetch_one(&*service.db)
+        .await
+    {
+        Ok(1) => build_check_status(true, None, info, start),
+        Ok(v) => build_check_status(false, Some(format!("unexpected result {}", v)), info, start),
+        Err(err) => build_check_status(false, Some(format!("sqlite error: {}", err)), info, start),
+    }
+}
+
+async fn check_storage_dir(base_path: &std::path::Path) -> CheckStatus {
+    let start = Instant::now();
+    let info = Some(format!("path={}", base_path.display()));
+    match fs::metadata(base_path).await {
+        Ok(metadata) => {
+            if metadata.is_dir() {
+                build_check_status(true, None, info, start)
+            } else {
+                build_check_status(
+                    false,
+                    Some("storage path exists but is not a directory".into()),
+                    info,
+                    start,
+                )
+            }
+        }
+        Err(err) => build_check_status(
+            false,
+            Some(format!("could not stat storage dir: {}", err)),
+            info,
+            start,
+        ),
+    }
+}
+
+async fn check_disk_io(base_path: &std::path::Path) -> CheckStatus {
+    let start = Instant::now();
+    let info = Some(format!("path={}", base_path.display()));
+    let tmp_path = base_path.join(format!(".readyz-{}", Uuid::new_v4()));
+
+    match fs::write(&tmp_path, b"readyz").await {
+        Ok(_) => match fs::read(&tmp_path).await {
+            Ok(bytes) => {
+                if bytes == b"readyz" {
+                    match fs::remove_file(&tmp_path).await {
+                        Ok(_) => build_check_status(true, None, info, start),
+                        Err(e) => build_check_status(
+                            true,
+                            Some(format!("wrote tmp file but could not remove it: {}", e)),
+                            info,
+                            start,
+                        ),
+                    }
+                } else {
+                    let _ = fs::remove_file(&tmp_path).await;
+                    build_check_status(false, Some("tmp file content mismatch".into()), info, start)
+                }
+            }
+            Err(e) => {
+                let _ = fs::remove_file(&tmp_path).await;
+                build_check_status(
+                    false,
+                    Some(format!("could not read tmp file: {}", e)),
+                    info,
+                    start,
+                )
+            }
+        },
+        Err(e) => build_check_status(
+            false,
+            Some(format!("could not write tmp file: {}", e)),
+            info,
+            start,
+        ),
+    }
 }
